@@ -20,10 +20,12 @@ import static android.app.WindowConfiguration.WINDOWING_MODE_FREEFORM;
 import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
+import android.os.Binder;
 import android.os.Handler;
 import android.os.Process;
 import android.util.Slog;
 
+import com.android.internal.app.IGameSpaceService;
 import com.android.server.LocalServices;
 import com.android.server.ServiceThread;
 import com.android.server.SystemService;
@@ -42,6 +44,44 @@ public final class GameSpaceService extends SystemService {
     private String mCurrentGame;
     private Runnable mPendingBoost;
 
+    private final IGameSpaceService.Stub mBinderService = new IGameSpaceService.Stub() {
+        @Override
+        public void setBypassCharge(boolean enabled) {
+            getContext().enforceCallingOrSelfPermission(
+                    android.Manifest.permission.WRITE_SECURE_SETTINGS, TAG);
+            final long token = Binder.clearCallingIdentity();
+            try {
+                mGameStateDispatcher.setBypassCharge(enabled);
+            } finally {
+                Binder.restoreCallingIdentity(token);
+            }
+        }
+
+        @Override
+        public boolean isBypassChargeActive() {
+            getContext().enforceCallingOrSelfPermission(
+                    android.Manifest.permission.WRITE_SECURE_SETTINGS, TAG);
+            final long token = Binder.clearCallingIdentity();
+            try {
+                return mGameStateDispatcher.isBypassChargeActive();
+            } finally {
+                Binder.restoreCallingIdentity(token);
+            }
+        }
+
+        @Override
+        public long getBypassChargePowerMicrowatts() {
+            getContext().enforceCallingOrSelfPermission(
+                    android.Manifest.permission.WRITE_SECURE_SETTINGS, TAG);
+            final long token = Binder.clearCallingIdentity();
+            try {
+                return mGameStateDispatcher.getBypassChargePowerMicrowatts();
+            } finally {
+                Binder.restoreCallingIdentity(token);
+            }
+        }
+    };
+
     public GameSpaceService(Context context) {
         super(context);
         mThread = new ServiceThread(TAG, Process.THREAD_PRIORITY_BACKGROUND, true);
@@ -54,6 +94,7 @@ public final class GameSpaceService extends SystemService {
 
     @Override
     public void onStart() {
+        publishBinderService("game_space", mBinderService);
         publishLocalService(GameSpaceService.class, this);
     }
 

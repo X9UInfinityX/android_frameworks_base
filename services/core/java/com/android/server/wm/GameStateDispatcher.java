@@ -17,10 +17,13 @@ package com.android.server.wm;
 
 import android.app.ActivityManager;
 import android.app.IActivityManager;
+import android.content.BroadcastReceiver;
 import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
+import android.content.IntentFilter;
 import android.os.BatteryManager;
+import android.os.FileUtils;
 import android.os.RemoteException;
 import android.os.SystemProperties;
 import android.os.UserHandle;
@@ -28,6 +31,8 @@ import android.provider.Settings;
 import android.util.Slog;
 
 import lineageos.health.HealthInterface;
+
+import java.io.File;
 
 class GameStateDispatcher {
     private static final String TAG = "GameStateDispatcher";
@@ -42,25 +47,49 @@ class GameStateDispatcher {
     private static final String KEY_BYPASS_CHARGE_ENABLED = "bypass_charge_enabled";
     private static final String KEY_POWER_MODE_PERF_BY_USER = "power_mode_perf_by_user";
     private static final String KEY_POWER_MODE_PERF = "persist.sys.power_mode_perf";
-    private static final int DEFAULT_CHARGE_LIMIT = 100;
+    static final String KEY_BYPASS_CHARGE_ACTIVE = "bypass_charge_active";
+    private static final String KEY_BYPASS_SAVED_ENABLED = "bypass_charge_saved_enabled";
+    private static final String KEY_BYPASS_SAVED_MODE = "bypass_charge_saved_mode";
+    private static final String KEY_BYPASS_SAVED_LIMIT = "bypass_charge_saved_limit";
+    private static final String USB_CURRENT_NOW = "/sys/class/power_supply/usb/current_now";
+    private static final String USB_VOLTAGE_NOW = "/sys/class/power_supply/usb/voltage_now";
 
     private final Context mContext;
     private final IActivityManager mActivityManager;
 
-    private int mChargeControlLimit = DEFAULT_CHARGE_LIMIT;
-    private boolean mWasChargingControlEnabled;
-    private boolean mBypassChargeActive;
+    private boolean mGameBypassRequested;
+    private boolean mManualBypassRequested;
+    private boolean mBypassActive;
 
     GameStateDispatcher(Context context) {
         mContext = context;
         mActivityManager = ActivityManager.getService();
+        mBypassActive = Settings.Global.getInt(mContext.getContentResolver(),
+                KEY_BYPASS_CHARGE_ACTIVE, 0) == 1;
+        if (mBypassActive) {
+            restoreBypassState();
+        }
+
+        final IntentFilter powerFilter = new IntentFilter();
+        powerFilter.addAction(Intent.ACTION_POWER_CONNECTED);
+        powerFilter.addAction(Intent.ACTION_POWER_DISCONNECTED);
+        mContext.registerReceiver(new BroadcastReceiver() {
+            @Override
+            public void onReceive(Context context, Intent intent) {
+                if (Intent.ACTION_POWER_DISCONNECTED.equals(intent.getAction())) {
+                    mManualBypassRequested = false;
+                }
+                updateBypassState();
+            }
+        }, powerFilter, Context.RECEIVER_NOT_EXPORTED);
     }
 
     void dispatchGameState(boolean active, String packageName) {
         Settings.Secure.putIntForUser(mContext.getContentResolver(), KEY_GAMING_MODE_ACTIVE,
                 active ? 1 : 0, UserHandle.USER_CURRENT);
         updateGameSession(active, packageName);
-        updateBypassCharge(active);
+        mGameBypassRequested = active && bypassChargeEnabled();
+        updateBypassState();
     }
 
     void boostGame(boolean enable) {
@@ -111,42 +140,62 @@ class GameStateDispatcher {
         }
     }
 
-    private void updateBypassCharge(boolean active) {
-        if (active) {
-            if (!bypassChargeEnabled()) {
-                return;
-            }
-            mChargeControlLimit = getChargingLimit();
-            setBypassActive(true);
-            setSmartChargeLevel(batteryLevel());
-            mBypassChargeActive = true;
-            return;
-        }
-
-        if (!mBypassChargeActive) {
-            return;
-        }
-        setBypassActive(false);
-        setSmartChargeLevel(mChargeControlLimit);
-        mBypassChargeActive = false;
-    }
-
     private boolean bypassChargeEnabled() {
         return Settings.System.getIntForUser(mContext.getContentResolver(),
                 KEY_BYPASS_CHARGE_ENABLED, 0, UserHandle.USER_CURRENT) == 1;
     }
 
-    private int getChargingLimit() {
-        try {
-            final HealthInterface health = HealthInterface.getInstance(mContext);
-            mWasChargingControlEnabled = health.getEnabled();
-            if (mWasChargingControlEnabled) {
-                return health.getLimit();
-            }
-        } catch (Exception e) {
-            Slog.w(TAG, "Failed to get charging limit", e);
+    synchronized void setBypassCharge(boolean enabled) {
+        Slog.i(TAG, "Manual charging bypass " + (enabled ? "requested" : "disabled"));
+        mManualBypassRequested = enabled;
+        if (!enabled) {
+            mGameBypassRequested = false;
         }
-        return DEFAULT_CHARGE_LIMIT;
+        updateBypassState();
+    }
+
+    synchronized boolean isBypassChargeActive() {
+        return mBypassActive;
+    }
+
+    synchronized long getBypassChargePowerMicrowatts() {
+        if (!mBypassActive) {
+            return 0;
+        }
+        final long currentMicroamps = readLong(USB_CURRENT_NOW);
+        final long voltageMicrovolts = readLong(USB_VOLTAGE_NOW);
+        if (currentMicroamps <= 0 || voltageMicrovolts <= 0) {
+            return 0;
+        }
+        return currentMicroamps * voltageMicrovolts / 1_000_000L;
+    }
+
+    private long readLong(String path) {
+        try {
+            return Long.parseLong(FileUtils.readTextFile(new File(path), 64, null).trim());
+        } catch (Exception e) {
+            Slog.w(TAG, "Failed to read " + path, e);
+            return 0;
+        }
+    }
+
+    private synchronized void updateBypassState() {
+        final boolean shouldEnable = isPowerConnected()
+                && (mGameBypassRequested || mManualBypassRequested);
+        if (shouldEnable == mBypassActive) {
+            return;
+        }
+        if (shouldEnable) {
+            enableBypass();
+        } else {
+            restoreBypassState();
+        }
+    }
+
+    private boolean isPowerConnected() {
+        final Intent battery = mContext.registerReceiver(
+                null, new IntentFilter(Intent.ACTION_BATTERY_CHANGED));
+        return battery != null && battery.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0) != 0;
     }
 
     private int batteryLevel() {
@@ -157,25 +206,89 @@ class GameStateDispatcher {
         return batteryManager.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY);
     }
 
-    private void setSmartChargeLevel(int value) {
-        if (value < 0) {
+    private void enableBypass() {
+        final int level = batteryLevel();
+        if (level < 0) {
+            return;
+        }
+        HealthInterface health = null;
+        boolean savedEnabled = false;
+        int savedMode = HealthInterface.MODE_LIMIT;
+        int savedLimit = 100;
+        boolean savedStateRead = false;
+        try {
+            health = HealthInterface.getInstance(mContext);
+            savedEnabled = health.getEnabled();
+            savedMode = health.getMode();
+            savedLimit = health.getLimit();
+            savedStateRead = true;
+
+            Settings.Global.putInt(mContext.getContentResolver(),
+                    KEY_BYPASS_SAVED_ENABLED, savedEnabled ? 1 : 0);
+            Settings.Global.putInt(mContext.getContentResolver(),
+                    KEY_BYPASS_SAVED_MODE, savedMode);
+            Settings.Global.putInt(mContext.getContentResolver(),
+                    KEY_BYPASS_SAVED_LIMIT, savedLimit);
+
+            boolean success = health.setEnabled(false);
+            success &= health.setMode(HealthInterface.MODE_LIMIT);
+            success &= health.setLimit(level);
+            Settings.Global.putInt(mContext.getContentResolver(),
+                    KEY_BYPASS_CHARGE_ACTIVE, 1);
+            success &= health.setEnabled(true);
+            if (!success) {
+                Slog.w(TAG, "Failed to enable charging bypass");
+                Settings.Global.putInt(mContext.getContentResolver(),
+                        KEY_BYPASS_CHARGE_ACTIVE, 0);
+                restoreChargingControl(health, savedEnabled, savedMode, savedLimit);
+                return;
+            }
+            mBypassActive = true;
+            Slog.i(TAG, "Charging bypass enabled at " + level + "%");
+        } catch (Exception e) {
+            Slog.w(TAG, "Failed to enable charging bypass", e);
+            Settings.Global.putInt(mContext.getContentResolver(),
+                    KEY_BYPASS_CHARGE_ACTIVE, 0);
+            if (health != null && savedStateRead) {
+                try {
+                    restoreChargingControl(health, savedEnabled, savedMode, savedLimit);
+                } catch (Exception restoreError) {
+                    Slog.w(TAG, "Failed to roll back charging control", restoreError);
+                }
+            }
+        }
+    }
+
+    private void restoreBypassState() {
+        if (!mBypassActive) {
             return;
         }
         try {
             final HealthInterface health = HealthInterface.getInstance(mContext);
-            health.setMode(HealthInterface.MODE_LIMIT);
-            health.setLimit(value);
+            final boolean savedEnabled = Settings.Global.getInt(mContext.getContentResolver(),
+                    KEY_BYPASS_SAVED_ENABLED, 0) == 1;
+            final int savedMode = Settings.Global.getInt(mContext.getContentResolver(),
+                    KEY_BYPASS_SAVED_MODE, HealthInterface.MODE_LIMIT);
+            final int savedLimit = Settings.Global.getInt(mContext.getContentResolver(),
+                    KEY_BYPASS_SAVED_LIMIT, 100);
+            Settings.Global.putInt(mContext.getContentResolver(),
+                    KEY_BYPASS_CHARGE_ACTIVE, 0);
+            restoreChargingControl(health, savedEnabled, savedMode, savedLimit);
         } catch (Exception e) {
-            Slog.w(TAG, "Failed to set charging limit", e);
+            Slog.w(TAG, "Failed to restore charging control", e);
+            Settings.Global.putInt(mContext.getContentResolver(),
+                    KEY_BYPASS_CHARGE_ACTIVE, 1);
+            return;
         }
+        mBypassActive = false;
+        Slog.i(TAG, "Charging bypass disabled and charging control restored");
     }
 
-    private void setBypassActive(boolean value) {
-        try {
-            final HealthInterface health = HealthInterface.getInstance(mContext);
-            health.setEnabled(value || mWasChargingControlEnabled);
-        } catch (Exception e) {
-            Slog.w(TAG, "Failed to set charging bypass", e);
-        }
+    private void restoreChargingControl(HealthInterface health, boolean enabled,
+            int mode, int limit) {
+        health.setEnabled(false);
+        health.setMode(mode);
+        health.setLimit(limit);
+        health.setEnabled(enabled);
     }
 }
