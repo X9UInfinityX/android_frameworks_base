@@ -1884,11 +1884,11 @@ public class PhoneWindowManager implements WindowManagerPolicy {
     }
 
     private void assistPress() {
-            if (InfinitiPlusKey.isInfiniti()) {
-                cancelPreloadRecentApps();
-                InfinitiPlusKey.fireShortPress(mContext);
-                return;
-            }
+        if (OplusPlusKey.isAvailable(mContext)) {
+            cancelPreloadRecentApps();
+            OplusPlusKey.fireShortPress(mContext);
+            return;
+        }
 
         if (!keyguardOn() && mAssistPressAction != Action.NOTHING) {
             if (mAssistPressAction != Action.APP_SWITCH) {
@@ -1905,13 +1905,13 @@ public class PhoneWindowManager implements WindowManagerPolicy {
     }
 
     private void assistLongPress() {
-            if (InfinitiPlusKey.isInfiniti()) {
-                cancelPreloadRecentApps();
-                performHapticFeedback(HapticFeedbackConstants.LONG_PRESS,
+        if (OplusPlusKey.isAvailable(mContext)) {
+            cancelPreloadRecentApps();
+            performHapticFeedback(HapticFeedbackConstants.LONG_PRESS,
                     "Plus Key - Long Press");
-                InfinitiPlusKey.fireLongPress(mContext);
-                return;
-            }
+            OplusPlusKey.fireLongPress(mContext);
+            return;
+        }
 
         if (!keyguardOn() && mAssistLongPressAction != Action.NOTHING) {
             if (mAssistLongPressAction != Action.APP_SWITCH) {
@@ -3200,7 +3200,7 @@ public class PhoneWindowManager implements WindowManagerPolicy {
 
         @Override
         boolean supportLongPress() {
-            return InfinitiPlusKey.isInfiniti()
+            return OplusPlusKey.isAvailable(mContext)
                     || mAssistLongPressAction != Action.NOTHING;
         }
 
@@ -5979,12 +5979,12 @@ public class PhoneWindowManager implements WindowManagerPolicy {
     }
 
     private void handleKeyGesture(KeyEvent event, boolean interactive, boolean defaultDisplayOn) {
-        if (InfinitiPlusKey.isInfiniti()
+        if (OplusPlusKey.isAvailable(mContext)
                 && event.getKeyCode() == KeyEvent.KEYCODE_ASSIST) {
             if (event.getAction() == KeyEvent.ACTION_DOWN && event.getRepeatCount() == 0) {
-                InfinitiPlusKey.fireCameraTriggerDown(mContext);
+                OplusPlusKey.fireCameraTriggerDown(mContext);
             } else if (event.getAction() == KeyEvent.ACTION_UP) {
-                InfinitiPlusKey.fireCameraTriggerUp(mContext);
+                OplusPlusKey.fireCameraTriggerUp(mContext);
             }
         }
 
