@@ -219,7 +219,9 @@ import com.android.systemui.surfaceeffects.core.ripple.RippleShader.RippleShape;
 import com.android.systemui.topui.TopUiController;
 import com.android.systemui.tuner.TunerService;
 import com.android.systemui.util.DumpUtilsKt;
+import com.android.systemui.util.ScrimUtils;
 import com.android.systemui.util.WallpaperController;
+import com.android.systemui.util.WallpaperDepthUtils;
 import com.android.systemui.util.concurrency.DelayableExecutor;
 import com.android.systemui.util.concurrency.MessageRouter;
 import com.android.systemui.util.kotlin.JavaAdapter;
@@ -436,10 +438,11 @@ public class CentralSurfacesImpl implements CoreStartable, CentralSurfaces,
     private final UserTracker mUserTracker;
     private final TunerService mTunerService;
     private final ActivityStarter mActivityStarter;
-    private final MediaViewController mMediaViewController;
+    private MediaViewController mMediaViewController;
     private final PulseViewController mPulseViewController;
     private final EdgeLightViewController mEdgeLightViewController;
     private final ChargingAnimationViewController mChargingAnimationViewController;
+    private WallpaperDepthUtils mWallpaperDepthUtils;
 
     private final DisplayMetrics mDisplayMetrics;
 
@@ -515,6 +518,14 @@ public class CentralSurfacesImpl implements CoreStartable, CentralSurfaces,
         // Trigger an update for the scrim state when we enter or exit glanceable hub, so that we
         // can transition to/from ScrimState.GLANCEABLE_HUB if needed.
         updateScrimController();
+        
+        // Force hide depth wallpaper and media art when glanceable hub is showing
+        if (mWallpaperDepthUtils != null) {
+            mWallpaperDepthUtils.onGlanceableHubShowingChanged(idleOnCommunal);
+        }
+        if (mMediaViewController != null) {
+            mMediaViewController.onGlanceableHubShowingChanged(idleOnCommunal);
+        }
     };
 
     private final SysuiStatusBarStateController mStatusBarStateController;
@@ -669,7 +680,8 @@ public class CentralSurfacesImpl implements CoreStartable, CentralSurfaces,
             PulseViewController pulseViewController,
             EdgeLightViewController edgeLightViewController,
             ChargingAnimationViewController chargingAnimationViewController,
-            BurnInProtectionController burnInProtectionController
+            BurnInProtectionController burnInProtectionController,
+            WallpaperDepthUtils wallpaperDepthUtils
     ) {
         mContext = context;
         mNotificationsController = notificationsController;
@@ -799,6 +811,7 @@ public class CentralSurfacesImpl implements CoreStartable, CentralSurfaces,
         mPulseViewController = pulseViewController;
         mEdgeLightViewController = edgeLightViewController;
         mChargingAnimationViewController = chargingAnimationViewController;
+        mWallpaperDepthUtils = wallpaperDepthUtils;
     }
 
     private void initBubbles(Bubbles bubbles) {
@@ -969,7 +982,7 @@ public class CentralSurfacesImpl implements CoreStartable, CentralSurfaces,
         mBurnInProtectionController.setNavigationBarView(getNavigationBarView());
     }
 
-    private ViewGroup getScrimOverlayContainer() {
+    private ViewGroup getRootViewContainer() {
         ViewGroup root = (ViewGroup) getNotificationShadeWindowView();
 
         FrameLayout container = root.findViewById(R.id.custom_overlay_container);
@@ -983,29 +996,26 @@ public class CentralSurfacesImpl implements CoreStartable, CentralSurfaces,
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT));
 
-        View scrimInFront = root.findViewById(R.id.scrim_in_front);
-        int scrimIndex = Math.max(root.indexOfChild(scrimInFront) - 3, 0);
-        root.addView(container, scrimIndex);
+        View keyguardRoot = root.findViewById(R.id.keyguard_root_view);
+        int index = root.indexOfChild(keyguardRoot);
+        root.addView(container, index);
 
         return container;
     }
 
     private void attachCustomOverlays() {
-        ViewGroup overlay = getScrimOverlayContainer();
-        ViewGroup root = (ViewGroup) getNotificationShadeWindowView();
+        ViewGroup overlay = getRootViewContainer();
 
         detachFromParent(mMediaViewController.getMediaArtScrim());
         detachFromParent(mPulseViewController.getPulseView());
         detachFromParent(mEdgeLightViewController.getEdgeLightView());
         detachFromParent(mChargingAnimationViewController.getChargingView());
 
-        View scrimBehind = root.findViewById(R.id.scrim_behind);
-        int scrimBehindIndex = Math.max(root.indexOfChild(scrimBehind), 0);
-        root.addView(mMediaViewController.getMediaArtScrim(), scrimBehindIndex,
+        overlay.addView(mMediaViewController.getMediaArtScrim(),
                 new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT));
-        root.addView(mPulseViewController.getPulseView(), scrimBehindIndex + 1,
+        overlay.addView(mPulseViewController.getPulseView(),
                 new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT));
@@ -1142,6 +1152,24 @@ public class CentralSurfacesImpl implements CoreStartable, CentralSurfaces,
             });
             mScrimController.attachViews(scrimBehind, notificationsScrim, scrimInFront);
         }
+
+        ViewGroup root = getNotificationShadeWindowView();
+        View depthWallpaperView = mWallpaperDepthUtils.getDepthWallpaperView();
+        if (depthWallpaperView.getParent() == null) {
+            root.setClipChildren(false);
+            root.setClipToPadding(false);
+            View keyguardRootView = root.findViewById(R.id.keyguard_root_view);
+            int insertIndex = root.indexOfChild(keyguardRootView) + 1;
+            root.addView(depthWallpaperView, insertIndex);
+        }
+        ScrimUtils.get(mContext).setWallpaperDepthUtils(mWallpaperDepthUtils);
+        // Trigger initial visibility update to ensure correct state on first keyguard show
+        mWallpaperDepthUtils.updateDepthWallpaper();
+        mWallpaperDepthUtils.updateDepthWallpaperVisibility();
+        // Delayed retry to handle cases where scrim state initializes after view attachment
+        depthWallpaperView.postDelayed(() -> {
+            mWallpaperDepthUtils.updateDepthWallpaperVisibility();
+        }, 500);
 
         mLightRevealScrim.setScrimOpaqueChangedListener((opaque) -> {
             Runnable updateOpaqueness = () -> {
@@ -2541,12 +2569,14 @@ public class CentralSurfacesImpl implements CoreStartable, CentralSurfaces,
             }
 
             mScrimController.onScreenTurnedOn();
+            com.android.systemui.util.ScrimUtils.get(mContext).onScreenStateChange();
         }
 
         @Override
         public void onScreenTurnedOff() {
             Trace.beginSection("CentralSurfaces#onScreenTurnedOff");
             mFalsingCollector.onScreenOff();
+            com.android.systemui.util.ScrimUtils.get(mContext).onScreenStateChange();
             if (!SceneContainerFlag.isEnabled()) {
                 mScrimController.onScreenTurnedOff();
             }

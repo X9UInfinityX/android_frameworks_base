@@ -25,9 +25,11 @@ import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.graphics.graphicsLayer
@@ -35,10 +37,6 @@ import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.launch
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableIntStateOf
-import androidx.compose.runtime.remember
-import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -60,12 +58,13 @@ import androidx.compose.ui.platform.LocalViewConfiguration
 import androidx.compose.ui.res.dimensionResource
 import com.android.compose.animation.Expandable
 import com.android.compose.animation.rememberExpandableController
+import com.android.systemui.animation.Expandable as SystemUiExpandable
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import android.graphics.drawable.Drawable
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.ui.res.stringResource
-import com.android.systemui.animation.Expandable as SystemUiExpandable
 import com.android.systemui.axdynamicbar.model.IslandEvent
 import com.android.systemui.axdynamicbar.shared.AlphaIconBg
 import com.android.systemui.axdynamicbar.shared.AlphaSecondary
@@ -112,6 +111,7 @@ fun AxDynamicBarChip(
 
     val touchSlop = LocalViewConfiguration.current.touchSlop
     val expandableController = rememberExpandableController(color = Color.Transparent, shape = ChipShape)
+    var currentExpandable by remember { mutableStateOf<SystemUiExpandable?>(null) }
 
     val motionScheme = MaterialTheme.motionScheme
 
@@ -141,14 +141,19 @@ fun AxDynamicBarChip(
                             } else if (!decided) {
 
                                 change.consume()
-                                val current = state?.event
-                                if (current is IslandEvent.AospChip) {
-                                    val expandable = SystemUiExpandable(expandableController.transitionSource)
-                                    if (!viewModel.handleAospChipTap(current, expandable)) {
-                                        viewModel.statusBarExpansion.toggle()
-                                    }
+                                if (viewModel.chipTapClosesPanel(down.uptimeMillis)) {
+                                    viewModel.statusBarExpansion.collapse()
                                 } else {
-                                    viewModel.statusBarExpansion.toggle()
+                                    val current = state?.event
+                                    if (current is IslandEvent.AospChip) {
+                                        val expandable = currentExpandable
+                                        if (expandable == null ||
+                                            !viewModel.handleAospChipTap(current, expandable)) {
+                                            viewModel.statusBarExpansion.expand()
+                                        }
+                                    } else {
+                                        viewModel.statusBarExpansion.expand()
+                                    }
                                 }
                             }
                             
@@ -191,7 +196,8 @@ fun AxDynamicBarChip(
                 controller = expandableController,
                 onClick = null,
                 defaultMinSize = false,
-            ) { _ ->
+            ) { expandable ->
+                currentExpandable = expandable
                 AnimatedContent(
                     targetState = chipDisplayKey(displayEvent, isAlert),
                     transitionSpec = {
@@ -227,22 +233,22 @@ fun AxDynamicBarChip(
 
                 val progress = chipProgressFor(event, includeMediaProgress = useCircleStyle)
 
-                if (useCircleStyle) {
-                    CircleChip(
-                        event = event,
-                        accent = accent,
-                        contentColor = contentColor,
-                        progress = progress,
-                        modifier = Modifier.squishAnimation(toggleCount),
-                    )
-                } else {
                 Box(
                     modifier = Modifier.fillMaxHeight(),
                     contentAlignment = Alignment.Center,
                 ) {
-                    Row(
-                        modifier =
-                            Modifier.height(ChipHeight)
+                    if (useCircleStyle) {
+                        CircleChip(
+                            event = event,
+                            accent = accent,
+                            contentColor = contentColor,
+                            progress = progress,
+                            modifier = Modifier.squishAnimation(toggleCount),
+                        )
+                    } else {
+                        Row(
+                            modifier =
+                                Modifier.height(ChipHeight)
                                 .widthIn(max = 100.dp)
                                 .clip(ChipShape)
                                 .background(accent)

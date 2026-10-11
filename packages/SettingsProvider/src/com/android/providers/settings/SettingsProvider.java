@@ -651,16 +651,16 @@ public class SettingsProvider extends ContentProvider {
                 || callingPackage.startsWith("com.google.android.")) {
             return null;
         }
-        
+
         String settings = null;
         try {
             AxSandboxManager sandboxManager =
                     getContext().getSystemService(AxSandboxManager.class);
             if (sandboxManager != null) {
-                settings = sandboxManager.getSpoofedSetting(callingPackage, name);
+                settings = sandboxManager.getSpoofedSetting(callingPackage, name, UserHandle.getCallingUserId());
             }
         } catch (Exception e) {}
-        
+
         return settings;
     }
 

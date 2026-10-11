@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2025-2026 AxionOS Project
+ * Copyright (C) 2025-2026 AxionOS
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,12 +15,16 @@
  */
 package com.android.server.wm;
 
-import android.content.Context;
+import android.app.ActivityManager;
+import android.app.IActivityManager;
 import android.content.BroadcastReceiver;
+import android.content.ComponentName;
+import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.os.BatteryManager;
 import android.os.FileUtils;
+import android.os.RemoteException;
 import android.os.SystemProperties;
 import android.os.UserHandle;
 import android.provider.Settings;
@@ -28,17 +32,22 @@ import android.util.Slog;
 
 import lineageos.health.HealthInterface;
 
-import com.android.internal.app.IGameSpaceCallback;
-
 import java.io.File;
-import java.util.List;
 
 class GameStateDispatcher {
-
     private static final String TAG = "GameStateDispatcher";
+    private static final String GAME_SPACE_PACKAGE = "io.chaldeaprjkt.gamespace";
+    private static final String GAME_SPACE_SESSION_SERVICE =
+            "io.chaldeaprjkt.gamespace.gamebar.SessionService";
+    private static final ComponentName GAME_SPACE_SESSION_COMPONENT =
+            new ComponentName(GAME_SPACE_PACKAGE, GAME_SPACE_SESSION_SERVICE);
+    private static final String ACTION_GAME_START = "game_start";
+    private static final String EXTRA_PACKAGE_NAME = "package_name";
     private static final String KEY_GAMING_MODE_ACTIVE = "ax_gaming_mode_active";
     private static final String KEY_BYPASS_CHARGE_ENABLED = "bypass_charge_enabled";
-    public static final String KEY_BYPASS_CHARGE_ACTIVE = "bypass_charge_active";
+    private static final String KEY_POWER_MODE_PERF_BY_USER = "power_mode_perf_by_user";
+    private static final String KEY_POWER_MODE_PERF = "persist.sys.power_mode_perf";
+    static final String KEY_BYPASS_CHARGE_ACTIVE = "bypass_charge_active";
     private static final String KEY_BYPASS_SAVED_ENABLED = "bypass_charge_saved_enabled";
     private static final String KEY_BYPASS_SAVED_MODE = "bypass_charge_saved_mode";
     private static final String KEY_BYPASS_SAVED_LIMIT = "bypass_charge_saved_limit";
@@ -46,23 +55,22 @@ class GameStateDispatcher {
     private static final String USB_VOLTAGE_NOW = "/sys/class/power_supply/usb/voltage_now";
 
     private final Context mContext;
-    private final List<IGameSpaceCallback> mCallbacks;
+    private final IActivityManager mActivityManager;
 
     private boolean mGameBypassRequested;
     private boolean mManualBypassRequested;
     private boolean mBypassActive;
 
-    GameStateDispatcher(Context context, List<IGameSpaceCallback> callbacks) {
+    GameStateDispatcher(Context context) {
         mContext = context;
-        mCallbacks = callbacks;
-
+        mActivityManager = ActivityManager.getService();
         mBypassActive = Settings.Global.getInt(mContext.getContentResolver(),
                 KEY_BYPASS_CHARGE_ACTIVE, 0) == 1;
         if (mBypassActive) {
             restoreBypassState();
         }
 
-        IntentFilter powerFilter = new IntentFilter();
+        final IntentFilter powerFilter = new IntentFilter();
         powerFilter.addAction(Intent.ACTION_POWER_CONNECTED);
         powerFilter.addAction(Intent.ACTION_POWER_DISCONNECTED);
         mContext.registerReceiver(new BroadcastReceiver() {
@@ -77,42 +85,70 @@ class GameStateDispatcher {
     }
 
     void dispatchGameState(boolean active, String packageName) {
-        Settings.Secure.putIntForUser(mContext.getContentResolver(),
-                KEY_GAMING_MODE_ACTIVE, active ? 1 : 0, UserHandle.USER_CURRENT);
-
-        for (IGameSpaceCallback callback : mCallbacks) {
-            try {
-                if (active && packageName != null) {
-                    callback.onGameStart(packageName);
-                } else {
-                    callback.onGameLeave();
-                }
-            } catch (Exception e) {
-                Slog.w(TAG, "Removing dead callback", e);
-                mCallbacks.remove(callback);
-            }
-        }
-
+        Settings.Secure.putIntForUser(mContext.getContentResolver(), KEY_GAMING_MODE_ACTIVE,
+                active ? 1 : 0, UserHandle.USER_CURRENT);
+        updateGameSession(active, packageName);
         mGameBypassRequested = active && bypassChargeEnabled();
         updateBypassState();
     }
 
     void boostGame(boolean enable) {
-        int perfByUser = Settings.System.getIntForUser(
-                mContext.getContentResolver(), "power_mode_perf_by_user", 0,
-                UserHandle.USER_CURRENT);
-        if (perfByUser == 1) return;
+        final int perfByUser = Settings.System.getIntForUser(mContext.getContentResolver(),
+                KEY_POWER_MODE_PERF_BY_USER, 0, UserHandle.USER_CURRENT);
+        if (perfByUser == 1) {
+            return;
+        }
 
-        Settings.System.putIntForUser(mContext.getContentResolver(),
-                "persist.sys.power_mode_perf", enable ? 1 : 0,
-                UserHandle.USER_CURRENT);
-        SystemProperties.set("persist.sys.power_mode_perf", enable ? "1" : "0");
+        Settings.System.putIntForUser(mContext.getContentResolver(), KEY_POWER_MODE_PERF,
+                enable ? 1 : 0, UserHandle.USER_CURRENT);
+        SystemProperties.set(KEY_POWER_MODE_PERF, enable ? "1" : "0");
     }
 
-    synchronized void setBypassCharge(boolean enable) {
-        Slog.i(TAG, "Manual charging bypass " + (enable ? "requested" : "disabled"));
-        mManualBypassRequested = enable;
-        if (!enable) {
+    private void updateGameSession(boolean active, String packageName) {
+        if (active) {
+            startGameSession(packageName);
+            return;
+        }
+        stopGameSession();
+    }
+
+    private void startGameSession(String packageName) {
+        if (packageName == null) {
+            return;
+        }
+        final Intent intent = new Intent(ACTION_GAME_START)
+                .setComponent(GAME_SPACE_SESSION_COMPONENT)
+                .putExtra(EXTRA_PACKAGE_NAME, packageName);
+        try {
+            final ComponentName result = mActivityManager.startService(null, intent, null, false,
+                    mContext.getOpPackageName(), mContext.getAttributionTag(),
+                    UserHandle.USER_CURRENT);
+            if (result == null) {
+                Slog.w(TAG, "GameSpace session service not found");
+            }
+        } catch (RemoteException | RuntimeException e) {
+            Slog.w(TAG, "Failed to start GameSpace session", e);
+        }
+    }
+
+    private void stopGameSession() {
+        final Intent intent = new Intent().setComponent(GAME_SPACE_SESSION_COMPONENT);
+        try {
+            mActivityManager.stopService(null, intent, null, UserHandle.USER_CURRENT);
+        } catch (RemoteException | RuntimeException e) {
+            Slog.w(TAG, "Failed to stop GameSpace session", e);
+        }
+    }
+
+    private boolean bypassChargeEnabled() {
+        return Settings.System.getIntForUser(mContext.getContentResolver(),
+                KEY_BYPASS_CHARGE_ENABLED, 0, UserHandle.USER_CURRENT) == 1;
+    }
+
+    synchronized void setBypassCharge(boolean enabled) {
+        Slog.i(TAG, "Manual charging bypass " + (enabled ? "requested" : "disabled"));
+        mManualBypassRequested = enabled;
+        if (!enabled) {
             mGameBypassRequested = false;
         }
         updateBypassState();
@@ -123,12 +159,14 @@ class GameStateDispatcher {
     }
 
     synchronized long getBypassChargePowerMicrowatts() {
-        if (!mBypassActive) return 0;
-
-        long currentMicroamps = readLong(USB_CURRENT_NOW);
-        long voltageMicrovolts = readLong(USB_VOLTAGE_NOW);
-        if (currentMicroamps <= 0 || voltageMicrovolts <= 0) return 0;
-
+        if (!mBypassActive) {
+            return 0;
+        }
+        final long currentMicroamps = readLong(USB_CURRENT_NOW);
+        final long voltageMicrovolts = readLong(USB_VOLTAGE_NOW);
+        if (currentMicroamps <= 0 || voltageMicrovolts <= 0) {
+            return 0;
+        }
         return currentMicroamps * voltageMicrovolts / 1_000_000L;
     }
 
@@ -141,18 +179,12 @@ class GameStateDispatcher {
         }
     }
 
-    private boolean bypassChargeEnabled() {
-        return SystemProperties.getBoolean("persist.sys.battery_bypass_supported", false)
-                && Settings.System.getIntForUser(mContext.getContentResolver(),
-                KEY_BYPASS_CHARGE_ENABLED, 0, UserHandle.USER_CURRENT) == 1;
-    }
-
     private synchronized void updateBypassState() {
-        boolean powerConnected = isPowerConnected();
-        boolean shouldEnable = powerConnected
+        final boolean shouldEnable = isPowerConnected()
                 && (mGameBypassRequested || mManualBypassRequested);
-        if (shouldEnable == mBypassActive) return;
-
+        if (shouldEnable == mBypassActive) {
+            return;
+        }
         if (shouldEnable) {
             enableBypass();
         } else {
@@ -161,15 +193,24 @@ class GameStateDispatcher {
     }
 
     private boolean isPowerConnected() {
-        Intent battery = mContext.registerReceiver(
+        final Intent battery = mContext.registerReceiver(
                 null, new IntentFilter(Intent.ACTION_BATTERY_CHANGED));
         return battery != null && battery.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0) != 0;
     }
 
-    private void enableBypass() {
-        int level = battLevel();
-        if (level < 0) return;
+    private int batteryLevel() {
+        final BatteryManager batteryManager = mContext.getSystemService(BatteryManager.class);
+        if (batteryManager == null) {
+            return -1;
+        }
+        return batteryManager.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY);
+    }
 
+    private void enableBypass() {
+        final int level = batteryLevel();
+        if (level < 0) {
+            return;
+        }
         HealthInterface health = null;
         boolean savedEnabled = false;
         int savedMode = HealthInterface.MODE_LIMIT;
@@ -202,7 +243,6 @@ class GameStateDispatcher {
                 restoreChargingControl(health, savedEnabled, savedMode, savedLimit);
                 return;
             }
-
             mBypassActive = true;
             Slog.i(TAG, "Charging bypass enabled at " + level + "%");
         } catch (Exception e) {
@@ -219,21 +259,17 @@ class GameStateDispatcher {
         }
     }
 
-    private int battLevel() {
-        BatteryManager bm = mContext.getSystemService(BatteryManager.class);
-        return bm != null ? bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY) : -1;
-    }
-
     private void restoreBypassState() {
-        if (!mBypassActive) return;
-
+        if (!mBypassActive) {
+            return;
+        }
         try {
-            HealthInterface health = HealthInterface.getInstance(mContext);
-            boolean savedEnabled = Settings.Global.getInt(mContext.getContentResolver(),
+            final HealthInterface health = HealthInterface.getInstance(mContext);
+            final boolean savedEnabled = Settings.Global.getInt(mContext.getContentResolver(),
                     KEY_BYPASS_SAVED_ENABLED, 0) == 1;
-            int savedMode = Settings.Global.getInt(mContext.getContentResolver(),
+            final int savedMode = Settings.Global.getInt(mContext.getContentResolver(),
                     KEY_BYPASS_SAVED_MODE, HealthInterface.MODE_LIMIT);
-            int savedLimit = Settings.Global.getInt(mContext.getContentResolver(),
+            final int savedLimit = Settings.Global.getInt(mContext.getContentResolver(),
                     KEY_BYPASS_SAVED_LIMIT, 100);
             Settings.Global.putInt(mContext.getContentResolver(),
                     KEY_BYPASS_CHARGE_ACTIVE, 0);
@@ -244,7 +280,6 @@ class GameStateDispatcher {
                     KEY_BYPASS_CHARGE_ACTIVE, 1);
             return;
         }
-
         mBypassActive = false;
         Slog.i(TAG, "Charging bypass disabled and charging control restored");
     }
