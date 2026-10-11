@@ -317,6 +317,11 @@ public class PhoneWindowManager implements WindowManagerPolicy {
     static final boolean DEBUG_WAKEUP = false;
     static final boolean DEBUG_DREAMS = false;
 
+    private static final int KEYCODE_SPRUCE_FIRST = 765;
+    private static final int KEYCODE_SPRUCE_DOUBLE_CLICK = 769;
+    private static final int KEYCODE_SPRUCE_START_CAMERA = 773;
+    private static final int KEYCODE_SPRUCE_LAST = 773;
+
     // Whether to allow dock apps with METADATA_DOCK_HOME to temporarily take over the Home key.
     // No longer recommended for desk docks;
     static final boolean ENABLE_DESK_DOCK_HOME_CAPTURE = false;
@@ -513,6 +518,7 @@ public class PhoneWindowManager implements WindowManagerPolicy {
     AppOpsManager mAppOpsManager;
     PackageManager mPackageManager;
     SideFpsEventHandler mSideFpsEventHandler;
+    SpruceButtonController mSpruceButtonController;
     LockPatternUtils mLockPatternUtils;
     private boolean mHasFeatureAuto;
     private boolean mHasFeatureWatch;
@@ -2420,6 +2426,28 @@ public class PhoneWindowManager implements WindowManagerPolicy {
         mContext.sendBroadcast(intent, android.Manifest.permission.STATUS_BAR_SERVICE);
     }
 
+    private static boolean isSpruceCameraButton(int keyCode) {
+        return keyCode >= KEYCODE_SPRUCE_FIRST && keyCode <= KEYCODE_SPRUCE_LAST;
+    }
+
+    private void launchSpruceCamera(long eventTime, boolean keyguardActive,
+            boolean interactive) {
+        final Intent intent = new Intent(keyguardActive
+                ? MediaStore.INTENT_ACTION_STILL_IMAGE_CAMERA_SECURE
+                : MediaStore.INTENT_ACTION_STILL_IMAGE_CAMERA);
+        intent.setPackage("com.oplus.camera");
+        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK
+                | Intent.FLAG_ACTIVITY_CLEAR_TOP
+                | Intent.FLAG_ACTIVITY_SINGLE_TOP);
+        intent.putExtra("android_camera_launch_type",
+                "spruce_double_tap_launch_from_framework");
+        intent.putExtra("android_camera_launch_type_screen_on", interactive);
+        if (!interactive) {
+            mWindowWakeUpPolicy.wakeUpFromCameraCover(eventTime);
+        }
+        startActivityAsUser(intent, UserHandle.CURRENT_OR_SELF);
+    }
+
     private void triggerVirtualKeypress(final int keyCode) {
         long now = SystemClock.uptimeMillis();
         final KeyEvent downEvent = new KeyEvent(now, now, KeyEvent.ACTION_DOWN,
@@ -2989,6 +3017,7 @@ public class PhoneWindowManager implements WindowManagerPolicy {
         initKeyGestures();
         mButtonOverridePermissionChecker = injector.getButtonOverridePermissionChecker();
         mSideFpsEventHandler = new SideFpsEventHandler(mContext, mHandler, mPowerManager);
+        mSpruceButtonController = new SpruceButtonController(mContext);
         mInteractiveDozeEnabled =
                 interactiveDozeExperience()
                         && mContext.getResources().getBoolean(
@@ -3038,7 +3067,9 @@ public class PhoneWindowManager implements WindowManagerPolicy {
     /**
      * Rule for single power key gesture.
      */
-    private final class PowerKeyRule extends SingleKeyGestureDetector.SingleKeyRule {
+    // Package-private and non-final for binary compatibility with OPlus's
+    // SinglePowerKeyMonitor.OplusPowerKeyRule implementation.
+    class PowerKeyRule extends SingleKeyGestureDetector.SingleKeyRule {
         PowerKeyRule() {
             super(KEYCODE_POWER);
         }
@@ -3083,12 +3114,12 @@ public class PhoneWindowManager implements WindowManagerPolicy {
                     if (action != ACTION_COMPLETE) {
                         return;
                     }
-                    onVeryLongPress();
+                    onVeryLongPress(startTime);
                     break;
             }
         }
 
-        private void onPress(long downTime, int displayId) {
+        void onPress(long downTime, int displayId) {
             if (mShouldEarlyShortPressOnPower) {
                 return;
             }
@@ -3120,16 +3151,23 @@ public class PhoneWindowManager implements WindowManagerPolicy {
                 return;
             }
             if (event.getAction() == ACTION_COMPLETE) {
-                powerLongPress(event.getStartTime());
+                onLongPress(event.getStartTime());
             }
         }
 
-        private void onVeryLongPress() {
+        // Legacy callbacks used by the Android 16 OPlus services jar. Keep the
+        // event-based Android 17 dispatcher above and forward completed gestures
+        // through these virtual methods so the OEM subclass can intercept them.
+        void onLongPress(long eventTime) {
+            powerLongPress(eventTime);
+        }
+
+        void onVeryLongPress(long eventTime) {
             mActivityManagerInternal.prepareForPossibleShutdown();
             powerVeryLongPress();
         }
 
-        private void onMultiPress(long downTime, int count, int displayId) {
+        void onMultiPress(long downTime, int count, int displayId) {
             powerPress(downTime, count, displayId);
         }
 
@@ -5421,8 +5459,23 @@ public class PhoneWindowManager implements WindowManagerPolicy {
             return 0;
         }
 
+        final boolean spruceHandled = isSpruceCameraButton(keyCode)
+                && mSpruceButtonController != null
+                && mSpruceButtonController.dispatchKeyEvent(event);
+        if (spruceHandled) {
+            result &= ~ACTION_PASS_TO_USER;
+        }
+
         // Handle special keys.
         switch (keyCode) {
+            case KEYCODE_SPRUCE_DOUBLE_CLICK:
+            case KEYCODE_SPRUCE_START_CAMERA: {
+                result &= ~ACTION_PASS_TO_USER;
+                if (!spruceHandled && down && event.getRepeatCount() == 0 && !canceled) {
+                    launchSpruceCamera(event.getEventTime(), keyguardActive, interactive);
+                }
+                break;
+            }
             case KeyEvent.KEYCODE_BACK: {
                 boolean isLongSwipe = (event.getFlags() & KeyEvent.FLAG_LONG_SWIPE) != 0;
                 notifyKeyGestureCompletedOnActionUp(event,
@@ -6476,6 +6529,11 @@ public class PhoneWindowManager implements WindowManagerPolicy {
             return;
         }
 
+        if (displayGroupId == Display.DEFAULT_DISPLAY_GROUP
+                && mSpruceButtonController != null) {
+            mSpruceButtonController.onScreenOff();
+        }
+
         if (DEBUG_WAKEUP) {
             Slog.i(TAG, "Started going to sleep... (groupId=" + displayGroupId + " why="
                     + WindowManagerPolicyConstants.offReasonToString(
@@ -6596,6 +6654,11 @@ public class PhoneWindowManager implements WindowManagerPolicy {
 
         if (!shouldFinishWakingUp(displayGroupId)) {
             return;
+        }
+
+        if (displayGroupId == Display.DEFAULT_DISPLAY_GROUP
+                && mSpruceButtonController != null) {
+            mSpruceButtonController.onScreenOn();
         }
 
         setPendingWakingUpGroup(Display.INVALID_DISPLAY_GROUP);
@@ -7097,6 +7160,7 @@ public class PhoneWindowManager implements WindowManagerPolicy {
         // In normal flow, systemReady is called before other system services are ready.
         // So it is better not to bind keyguard here.
         mKeyguardDelegate.onSystemReady();
+        mSpruceButtonController.start();
 
         if (mContext.getResources().getBoolean(com.android.internal.R.bool.config_pocketModeSupported)) {
             mPocketManager = (PocketManager) mContext.getSystemService(Context.POCKET_SERVICE);
