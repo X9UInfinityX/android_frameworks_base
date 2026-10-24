@@ -11328,6 +11328,16 @@
             android:name="com.android.server.patch.34957421"
             android:value="true" />
 
+        <!-- Oplus services hosts the stock app-feature provider used by UMS. -->
+        <provider
+            android:name="com.oplus.customize.appfeature.configprovider.AppFeatureProvider"
+            android:authorities="com.oplus.customize.coreapp.configmanager.configprovider.AppFeatureProvider"
+            android:process="system"
+            android:singleUser="true"
+            android:exported="true"
+            android:initOrder="102"
+            android:writePermission="oplus.permission.OPLUS_COMPONENT_SAFE" />
+
     </application>
 
 </manifest>
